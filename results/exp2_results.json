@@ -1,0 +1,8 @@
+{
+  "parity_error": 0.0,
+  "implied_vol_recovered": 0.1999999999945308,
+  "power_claim_V0": 1.030454533953517,
+  "power_claim_Delta0": -2.060909067907034,
+  "hedging_error_mean": -0.0008065752749866355,
+  "hedging_error_std": 0.017693189930349556
+}
