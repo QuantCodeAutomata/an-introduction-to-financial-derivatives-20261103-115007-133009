@@ -1,6 +1,8 @@
 # An Introduction to Financial Derivatives
 
-**Paper:** "An Introduction to Financial Derivatives" (lecture notes)
+**Paper:** Matthew Lorig, *An Introduction to Financial Derivatives: Open Lecture Notes*,
+arXiv:2611.01355v1, 2026.
+Source: <https://github.com/mattlorig/intro-financial-derivatives>
 
 This repository reproduces the computational experiments from the lecture notes on financial derivatives, covering binomial trees, the Black-Scholes model, stochastic volatility, Dupire local volatility, and the Heston model.
 

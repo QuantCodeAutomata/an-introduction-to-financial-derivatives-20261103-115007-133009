@@ -37,7 +37,7 @@ def test_heston_call_at_zero_vol_lim() -> None:
     sigma = 0.20
     params = HestonParams(v0=sigma**2, kappa=2.0, theta=sigma**2, delta=1e-4, rho=0.0, r=0.0)
     S, K, T = 100.0, 100.0, 1.0
-    heston_price = heston_call(S, K, T, params, n_integration=200, upper_limit=300.0)
+    heston_price = heston_call(S, K, T, params, upper_limit=300.0)
     bs_price = bs_call(0.0, S, sigma, T, K, 0.0)
     assert abs(heston_price - bs_price) < 0.05, (
         f"Heston price {heston_price:.4f} not close to BS {bs_price:.4f}"

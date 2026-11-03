@@ -2,7 +2,8 @@
 
 ## What this repository implements
 
-Computational experiments from the lecture notes "An Introduction to Financial Derivatives", covering:
+Computational experiments from Matthew Lorig, *An Introduction to Financial Derivatives: Open Lecture Notes*,
+arXiv:2611.01355v1, 2026 (<https://github.com/mattlorig/intro-financial-derivatives>), covering:
 
 - **Chapter 3 (exp_1):** Binomial tree pricing and hedging of European and American options.
 - **Chapter 6 (exp_2):** Black-Scholes closed-form pricing, power claims, Monte Carlo delta-hedging simulation, and implied volatility inversion.

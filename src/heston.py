@@ -7,6 +7,7 @@ model with coefficients:
 Pricing uses the semi-analytical characteristic-function representation
 (Heston 1993) rather than the Riccati ODE formulas, which the notes omit
 (page 152: "We will not give the expressions for C and D here").
+Fourier inversion uses vectorised Gauss-Legendre quadrature (Gil-Pelaez 1951).
 
 Calibration minimises the sum of squared differences between Heston and
 market implied volatilities (Section 10.4, Eq. on page 153).
@@ -15,15 +16,16 @@ market implied volatilities (Section 10.4, Eq. on page 153).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
-from scipy.integrate import quad
 from scipy.optimize import differential_evolution, minimize
 
-from src.black_scholes import bs_call
 from src.implied_vol import implied_vol_call
+
+# Pre-compute 64-point Gauss-Legendre nodes/weights on [0, 1] once at import.
+_GL_NODES_01, _GL_WEIGHTS_01 = np.polynomial.legendre.leggauss(64)
 
 
 @dataclass
@@ -45,8 +47,8 @@ class HestonParams:
     r: float = 0.0
 
 
-def _heston_cf(
-    u: complex,
+def _heston_cf_vec(
+    u: np.ndarray,
     tau: float,
     v0: float,
     kappa: float,
@@ -54,51 +56,32 @@ def _heston_cf(
     delta: float,
     rho: float,
     r: float,
-    S: float,
-) -> complex:
-    """Heston characteristic function phi(u) = E[exp(i*u*log(S_T)) | S_0, v_0].
+    log_S: float,
+) -> np.ndarray:
+    """Vectorised Heston log-stock CF phi(u) for a 1-D complex array u.
 
-    Uses the Heston (1993) formulation; see e.g. Heston (1993), Eq. (17)–(18).
-    The standard representation with the complex square-root branch chosen to
-    avoid discontinuities.
+    Uses the formulation from Heston (1993), Eqs. (17)–(18), with the
+    square-root branch chosen to avoid the discontinuity noted by
+    Albrecher et al. (2007): d is computed with np.sqrt (branch on negative
+    real axis) and the log of the ratio uses np.log with the same branch.
     """
-    # Compute d = sqrt((kappa - i*rho*delta*u)^2 + delta^2*(i*u + u^2))
-    kappa_adj = kappa - 1j * rho * delta * u
-    d = cmath_sqrt(kappa_adj**2 + delta**2 * (1j * u + u**2))
+    kappa_adj = kappa - 1j * rho * delta * u          # kappa - i*rho*delta*u
+    d = np.sqrt(kappa_adj**2 + delta**2 * (1j * u + u**2))
     g = (kappa_adj - d) / (kappa_adj + d)
-    exp_d_tau = cmath_exp(-d * tau)
-    # Ensure no division by zero
+    exp_d_tau = np.exp(-d * tau)
     denom_D = 1.0 - g * exp_d_tau
-    if abs(denom_D) < 1e-15:
-        denom_D = 1e-15
-    denom_C_log = 1.0 - g * exp_d_tau
     denom_C = 1.0 - g
-    if abs(denom_C) < 1e-15:
-        denom_C = 1e-15
+    # Guard against exact zeros (negligible numerical event)
+    denom_D = np.where(np.abs(denom_D) < 1e-300, 1e-300, denom_D)
+    denom_C = np.where(np.abs(denom_C) < 1e-300, 1e-300, denom_C)
     D = (kappa_adj - d) / delta**2 * (1.0 - exp_d_tau) / denom_D
     C = (
         r * 1j * u * tau
         + kappa * theta / delta**2 * (
-            (kappa_adj - d) * tau - 2.0 * cmath_log(denom_C_log / denom_C)
+            (kappa_adj - d) * tau - 2.0 * np.log(denom_D / denom_C)
         )
     )
-    return cmath_exp(C + D * v0 + 1j * u * math.log(S))
-
-
-def cmath_sqrt(z: complex) -> complex:
-    """Branch cut on the negative real axis (standard Python cmath)."""
-    import cmath
-    return cmath.sqrt(z)
-
-
-def cmath_exp(z: complex) -> complex:
-    import cmath
-    return cmath.exp(z)
-
-
-def cmath_log(z: complex) -> complex:
-    import cmath
-    return cmath.log(z)
+    return np.exp(C + D * v0 + 1j * u * log_S)
 
 
 def heston_call(
@@ -108,65 +91,97 @@ def heston_call(
     params: HestonParams,
     *,
     t: float = 0.0,
-    n_integration: int = 200,
-    upper_limit: float = 500.0,
+    upper_limit: float = 200.0,
 ) -> float:
-    """Heston European call price via Fourier inversion (Heston 1993).
+    """Heston European call price via Gil-Pelaez Fourier inversion.
 
-    Uses the Carr-Madan / Lewis representation:
-      C = S * exp(-r*tau) * P1 - K * exp(-r*tau) * P2
-    where Pj are recovered by integrating the characteristic function.
+    Uses the two-integral representation (Heston 1993):
+      C = S * P1 - K * exp(-r*tau) * P2
+    with P1, P2 computed by vectorised 64-point Gauss-Legendre quadrature
+    on [0, upper_limit].
 
     Parameters
     ----------
-    S, K, T  : spot, strike, maturity
-    params   : HestonParams
-    t        : current time (default 0)
-    n_integration : Gauss-Laguerre quadrature points
-    upper_limit   : integration truncation
+    S, K, T      : spot, strike, maturity
+    params       : HestonParams
+    t            : current time
+    upper_limit  : Fourier truncation (200 is sufficient for typical params)
 
     Returns
     -------
-    European call price (float).
+    European call price (float ≥ intrinsic value).
     """
     tau = T - t
     if tau <= 0.0:
         return max(S - K, 0.0)
-    v0 = params.v0
-    kappa = params.kappa
-    theta = params.theta
-    delta = params.delta
-    rho = params.rho
-    r = params.r
-    log_K = math.log(K)
 
-    def integrand_P1(u: float) -> float:
-        # P1 uses phi evaluated at u - i
-        cf = _heston_cf(
-            complex(u, -1.0), tau, v0, kappa, theta, delta, rho, r, S
-        )
-        # Normalise by phi(-i) to get the stock-measure CF
-        cf_norm = _heston_cf(
-            complex(0.0, -1.0), tau, v0, kappa, theta, delta, rho, r, S
-        )
-        val = cf / cf_norm
-        re = (val * cmath_exp(-1j * u * log_K) / (1j * u)).real
-        return re
+    v0, kappa, theta, delta, rho, r = (
+        params.v0, params.kappa, params.theta,
+        params.delta, params.rho, params.r,
+    )
+    log_S, log_K = math.log(S), math.log(K)
 
-    def integrand_P2(u: float) -> float:
-        cf = _heston_cf(
-            complex(u, 0.0), tau, v0, kappa, theta, delta, rho, r, S
-        )
-        re = (cf * cmath_exp(-1j * u * log_K) / (1j * u)).real
-        return re
+    # Map GL nodes from [-1,1] to [0, upper_limit]
+    u = (_GL_NODES_01 + 1.0) / 2.0 * upper_limit   # shape (64,)
+    w = _GL_WEIGHTS_01 / 2.0 * upper_limit           # shape (64,)
 
-    I1, _ = quad(integrand_P1, 1e-6, upper_limit, limit=n_integration)
-    I2, _ = quad(integrand_P2, 1e-6, upper_limit, limit=n_integration)
+    # P2: integrand Re[ phi(u) * exp(-i*u*log K) / (i*u) ]
+    phi2 = _heston_cf_vec(u + 0j, tau, v0, kappa, theta, delta, rho, r, log_S)
+    integ2 = (phi2 * np.exp(-1j * u * log_K) / (1j * u)).real
+    P2 = 0.5 + np.dot(w, integ2) / math.pi
 
-    P1 = 0.5 + I1 / math.pi
-    P2 = 0.5 + I2 / math.pi
+    # P1: integrand Re[ phi(u-i) / phi(-i) * exp(-i*u*log K) / (i*u) ]
+    phi1 = _heston_cf_vec(u - 1j, tau, v0, kappa, theta, delta, rho, r, log_S)
+    phi_norm = _heston_cf_vec(
+        np.array([-1j]), tau, v0, kappa, theta, delta, rho, r, log_S
+    )[0]
+    integ1 = (phi1 / phi_norm * np.exp(-1j * u * log_K) / (1j * u)).real
+    P1 = 0.5 + np.dot(w, integ1) / math.pi
+
     call = math.exp(-r * tau) * (S * math.exp(r * tau) * P1 - K * P2)
-    return max(call, max(S * math.exp(-r * tau) - K * math.exp(-r * tau), 0.0))
+    intrinsic = max(S * math.exp(-r * tau) - K * math.exp(-r * tau), 0.0)
+    return max(float(np.real(call)), intrinsic)
+
+
+def _heston_calls_for_params(
+    S: float,
+    T_arr: np.ndarray,
+    K_arr: np.ndarray,
+    v0: float,
+    kappa: float,
+    theta: float,
+    delta: float,
+    rho: float,
+    r: float,
+    t: float,
+    upper_limit: float = 200.0,
+) -> np.ndarray:
+    """Vectorised call prices for a (T, K) grid, reusing one CF per maturity."""
+    log_S = math.log(S)
+    u = (_GL_NODES_01 + 1.0) / 2.0 * upper_limit
+    w = _GL_WEIGHTS_01 / 2.0 * upper_limit
+    prices = np.empty((len(T_arr), len(K_arr)))
+    for i, T in enumerate(T_arr):
+        tau = T - t
+        if tau <= 0.0:
+            for j, K in enumerate(K_arr):
+                prices[i, j] = max(S - K, 0.0)
+            continue
+        phi2 = _heston_cf_vec(u + 0j, tau, v0, kappa, theta, delta, rho, r, log_S)
+        phi1 = _heston_cf_vec(u - 1j, tau, v0, kappa, theta, delta, rho, r, log_S)
+        phi_norm = _heston_cf_vec(
+            np.array([-1j]), tau, v0, kappa, theta, delta, rho, r, log_S
+        )[0]
+        for j, K in enumerate(K_arr):
+            log_K = math.log(K)
+            integ2 = (phi2 * np.exp(-1j * u * log_K) / (1j * u)).real
+            P2 = 0.5 + np.dot(w, integ2) / math.pi
+            integ1 = (phi1 / phi_norm * np.exp(-1j * u * log_K) / (1j * u)).real
+            P1 = 0.5 + np.dot(w, integ1) / math.pi
+            call = math.exp(-r * tau) * (S * math.exp(r * tau) * P1 - K * P2)
+            intrinsic = max(S * math.exp(-r * tau) - K * math.exp(-r * tau), 0.0)
+            prices[i, j] = max(float(np.real(call)), intrinsic)
+    return prices
 
 
 def heston_implied_vol(
@@ -180,7 +195,7 @@ def heston_implied_vol(
 ) -> float | None:
     """Convert Heston call price to BS implied volatility.
 
-    Returns None if conversion fails (price outside no-arb bounds or numerical issue).
+    Returns None if conversion fails (price outside no-arb bounds).
     """
     r_use = r if r is not None else params.r
     price = heston_call(S, K, T, params, t=t)
@@ -209,10 +224,13 @@ def calibrate_heston(
 
     Minimises: sum_{(T,K)} (sigma^M(T,K) - sigma^H(T,K; Xi))^2  (Section 10.4)
 
+    Uses differential evolution (global) followed by Nelder-Mead (local).
+    Pricing uses vectorised GL quadrature for speed.
+
     Parameters
     ----------
     S             : current spot price
-    market_ivols  : matrix of market implied vols, shape (len(T_grid), len(K_grid))
+    market_ivols  : matrix of market implied vols, shape (nT, nK)
     T_grid        : list of maturities
     K_grid        : list of strikes
     r             : risk-free rate
@@ -235,30 +253,45 @@ def calibrate_heston(
 
     T_arr = np.array(T_grid)
     K_arr = np.array(K_grid)
+    n_obs = len(T_arr) * len(K_arr)
     mkt_flat = market_ivols.flatten()
 
-    def objective(x: np.ndarray) -> float:
-        v0, kappa, theta, delta, rho = x
-        p = HestonParams(v0=v0, kappa=kappa, theta=theta, delta=delta, rho=rho, r=r)
-        sq_errors = []
-        for i, T in enumerate(T_arr):
-            for j, K in enumerate(K_arr):
-                iv_h = heston_implied_vol(S, K, T, p, t=t, r=r)
-                if iv_h is None:
-                    sq_errors.append(1.0)  # large penalty for failed pricing
-                else:
-                    err = market_ivols[i, j] - iv_h
-                    sq_errors.append(err**2)
-        return sum(sq_errors)
+    from src.black_scholes import bs_call  # local import to avoid circularity
 
-    # Global optimisation first (DE), then local refinement
+    def _ivols_from_prices(prices: np.ndarray, x: np.ndarray) -> np.ndarray:
+        """Batch implied-vol inversion; returns NaN for out-of-bounds nodes."""
+        v0_, kappa_, theta_, delta_, rho_ = x
+        ivols = np.full(prices.shape, np.nan)
+        for i, T in enumerate(T_arr):
+            tau = T - t
+            for j, K in enumerate(K_arr):
+                try:
+                    iv = implied_vol_call(float(prices[i, j]), t, S, T, K, r)
+                    ivols[i, j] = iv
+                except (ValueError, RuntimeError):
+                    pass
+        return ivols
+
+    def objective(x: np.ndarray) -> float:
+        v0_, kappa_, theta_, delta_, rho_ = x
+        prices = _heston_calls_for_params(
+            S, T_arr, K_arr, v0_, kappa_, theta_, delta_, rho_, r, t
+        )
+        ivols = _ivols_from_prices(prices, x)
+        mask = ~np.isnan(ivols.flatten())
+        if mask.sum() == 0:
+            return float(n_obs)  # maximum penalty
+        err = mkt_flat[mask] - ivols.flatten()[mask]
+        penalty = float(n_obs - mask.sum())  # penalty for failed nodes
+        return float(np.sum(err**2)) + penalty
+
     result_de = differential_evolution(
         objective,
         bounds,
         seed=seed,
-        maxiter=200,
-        tol=1e-6,
-        popsize=12,
+        maxiter=80,
+        tol=1e-5,
+        popsize=8,
         mutation=(0.5, 1),
         recombination=0.7,
         workers=1,
@@ -267,11 +300,10 @@ def calibrate_heston(
         objective,
         result_de.x,
         method="Nelder-Mead",
-        options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-8},
+        options={"maxiter": 1000, "xatol": 1e-5, "fatol": 1e-7},
     )
     v0, kappa, theta, delta, rho = result.x
     calibrated = HestonParams(v0=v0, kappa=kappa, theta=theta, delta=delta, rho=rho, r=r)
-    n_obs = len(T_arr) * len(K_arr)
     rmse = math.sqrt(result.fun / n_obs)
     return calibrated, rmse
 
@@ -288,10 +320,19 @@ def heston_surface(
 
     Returns matrix of shape (len(T_grid), len(K_grid)) with NaN for failed nodes.
     """
+    T_arr = np.array(T_grid)
+    K_arr = np.array(K_grid)
+    prices = _heston_calls_for_params(
+        S, T_arr, K_arr,
+        params.v0, params.kappa, params.theta, params.delta, params.rho,
+        params.r, t,
+    )
     ivols = np.full((len(T_grid), len(K_grid)), np.nan)
-    for i, T in enumerate(T_grid):
-        for j, K in enumerate(K_grid):
-            iv = heston_implied_vol(S, K, T, params, t=t)
-            if iv is not None:
+    for i, T in enumerate(T_arr):
+        for j, K in enumerate(K_arr):
+            try:
+                iv = implied_vol_call(float(prices[i, j]), t, S, T, K, params.r)
                 ivols[i, j] = iv
+            except (ValueError, RuntimeError):
+                pass
     return ivols

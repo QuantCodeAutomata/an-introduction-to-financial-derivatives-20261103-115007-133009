@@ -1,8 +1,8 @@
 {
   "onestep_call_V0": 5.000000000000007,
-  "twostep_call_V0": 5.250000000000009,
-  "european_put_V0": 8.3449269099363,
-  "european_put_Delta0": 0.735434750322152,
-  "american_put_V0": 8.344950911115573,
-  "american_put_Delta0": 0.7354473903324202
+  "twostep_call_V0": 5.249999999999998,
+  "european_put_V0": 2.69547856559881,
+  "european_put_Delta0": -0.46228407958813805,
+  "american_put_V0": 5.0,
+  "american_put_Delta0": -1.0
 }
